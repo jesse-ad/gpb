@@ -1273,7 +1273,6 @@ format_decoder_topcase(Indent, Defs, BinVar, MsgNameVar) ->
 
 format_decoders(Defs, AnRes, Opts) ->
     [format_enum_decoders(Defs, AnRes),
-     format_initial_msgs(Defs, AnRes),
      format_msg_decoders(Defs, AnRes, Opts)].
 
 format_enum_decoders(Defs, #anres{used_types=UsedTypes}) ->
@@ -1288,64 +1287,12 @@ format_enum_decoders(Defs, #anres{used_types=UsedTypes}) ->
      || {{enum, EnumName}, EnumDef} <- Defs,
         smember({enum,EnumName}, UsedTypes)].
 
-format_initial_msgs(Defs, AnRes) ->
-    [format_initial_msg(MsgName, MsgDef, Defs, AnRes)
-     || {{msg, MsgName}, MsgDef} <- Defs].
-
-format_initial_msg(MsgName, MsgDef, Defs, AnRes) ->
-    case get_field_pass(MsgName, AnRes) of
-        pass_as_params -> ""; %% handled in d_read_field_def_<MsgName>/1
-        pass_as_record -> format_initial_msg_par(MsgName, MsgDef, Defs)
-    end.
-
-format_initial_msg_par(MsgName, MsgDef, Defs) ->
-    [f("~p() ->~n", [mk_fn(msg0_, MsgName)]),
-     indent(4, format_initial_msg_record(4, MsgName, MsgDef, Defs)),
-     ".\n\n"].
-
-format_initial_msg_record(Indent, MsgName, MsgDef, Defs) ->
-    MsgNameQLen = flength("~p", [MsgName]),
-    f("#~p{~s}",
-      [MsgName, format_initial_msg_fields(Indent+MsgNameQLen+2, MsgDef, Defs)]).
-
-format_initial_msg_fields(Indent, MsgDef, Defs) ->
-    outdent_first(
-      string:join(
-        [case Field of
-             #field{occurrence=repeated} ->
-                 indent(Indent, f("~p = []", [FName]));
-             #field{type={msg,FMsgName}} ->
-                 FNameQLen = flength("~p", [FName]),
-                 {Type, FMsgDef} = lists:keyfind(Type, 1, Defs),
-                 indent(Indent, f("~p = ~s",
-                                  [FName,
-                                   format_initial_msg_record(Indent+FNameQLen+2,
-                                                             FMsgName, FMsgDef,
-                                                             Defs)]))
-         end
-         || #field{name=FName, type=Type}=Field <- MsgDef,
-            case Field of
-                #field{occurrence=repeated} -> true;
-                #field{occurrence=optional} -> false;
-                #field{type={msg,_}}        -> true;
-                _                           -> false
-            end],
-        ",\n")).
-
-format_initial_field_values(MsgDef) ->
-    [[", ", case Occurrence of
-                repeated -> "[]";
-                required -> "undefined"; %% Use default value? (if available)
-                optional -> "undefined"
-            end] || #field{occurrence = Occurrence} <- MsgDef].
-
 format_msg_decoders(Defs, AnRes, Opts) ->
     [format_msg_decoder(MsgName, MsgDef, AnRes, Opts)
      || {{msg, MsgName}, MsgDef} <- Defs].
 
 format_msg_decoder(MsgName, MsgDef, AnRes, Opts) ->
     [format_msg_decoder_read_field(MsgName, MsgDef, AnRes),
-     format_msg_decoder_reverse_toplevel(MsgName, MsgDef, AnRes),
      format_field_decoders(MsgName, MsgDef, AnRes, Opts),
      format_field_adders(MsgName, MsgDef, AnRes),
      format_field_skippers(MsgName, AnRes)].
@@ -1357,123 +1304,98 @@ format_msg_decoder_read_field(MsgName, MsgDef, AnRes) ->
     end.
 
 format_msg_decoder_read_field_pap(MsgName, MsgDef) ->
-    FieldVars = [f(", F~w", [I]) || I <- lists:seq(1,length(MsgDef))],
-    ReadFieldCases = format_read_field_cases(MsgName, MsgDef, pass_as_params,
-                                             FieldVars),
-    MsgIndent = flength("    #~p{", [MsgName]),
-    FieldSets = string:join([case Occurrence of
-                                 required -> f("~p = F~w", [FName, I]);
-                                 optional -> f("~p = F~w", [FName, I]);
-                                 repeated -> f("~p = lists:reverse(F~w)",
-                                               [FName, I])
-                             end
-                             || {I, #field{occurrence=Occurrence,
-                                           name=FName}} <- index_seq(MsgDef)],
-                            f(",~n~s",[indent(MsgIndent, "")])),
-    [f("~p(Bin) ->~n", [mk_fn(d_msg_, MsgName)]),
-     f("    ~p(Bin, 0, 0~s).~n",
-       [mk_fn(d_read_field_def_, MsgName),
-        format_initial_field_values(MsgDef)]),
-     "\n",
-     f("~p(<<1:1, X:7, Rest/binary>>, N, Acc~s) ->~n"
-       "    ~p(Rest, N+7, X bsl N + Acc~s);~n",
-       [mk_fn(d_read_field_def_, MsgName), FieldVars,
-        mk_fn(d_read_field_def_, MsgName), FieldVars]),
-     f("~p(<<0:1, X:7, Rest/binary>>, N, Acc~s) ->~n"
-       "    Key = X bsl N + Acc,~n",
-       [mk_fn(d_read_field_def_, MsgName), FieldVars]),
-     if ReadFieldCases == [] ->
-             f("    case Key band 7 of  %% WireType~n"
-               "        0 -> skip_varint_~s(Rest, 1, 1~s);~n"
-               "        1 -> skip_64_~s(Rest, 1, 1~s);~n"
-               "        2 -> skip_length_delimited_~s(Rest, 0, 0~s);~n"
-               "        5 -> skip_32_~s(Rest, 1, 1~s)~n"
-               "    end;~n",
-               [MsgName, FieldVars,
-                MsgName, FieldVars,
-                MsgName, FieldVars,
-                MsgName, FieldVars]);
-        true ->
-             f("    case Key of~n"
-               "~s"
-               "        _ ->~n"
-               "            case Key band 7 of %% wiretype~n"
-               "                0 -> skip_varint_~s(Rest, 1, 1~s);~n"
-               "                1 -> skip_64_~s(Rest, 1, 1~s);~n"
-               "                2 -> skip_length_delimited_~s(Rest,0,0~s);~n"
-               "                5 -> skip_32_~s(Rest, 1, 1~s)~n"
-               "            end~n"
-               "    end;~n",
-               [ReadFieldCases,
-                MsgName, FieldVars,
-                MsgName, FieldVars,
-                MsgName, FieldVars,
-                MsgName, FieldVars])
-     end,
-     f("~p(<<>>, 0, 0~s) ->~n", [mk_fn(d_read_field_def_, MsgName), FieldVars]),
-     f("    #~p{~s}.~n~n", [MsgName, FieldSets])].
+    FieldVars = field_vars(MsgDef),
+    msg_decoder_read_field_cmn(
+      MsgName, MsgDef,
+      FieldVars,
+      {initial_values, initial_field_values(MsgDef)},
+      r(MsgName,
+        [case Occ of
+             required -> {FName, field_var(I)};
+             optional -> {FName, field_var(I)};
+             repeated -> {FName, ff("lists:reverse(~s)", [field_var(I)])}
+         end
+         || {I, #field{name=FName, occurrence=Occ}} <- index_seq(MsgDef)])).
+
+field_vars(MsgDef) ->
+    [field_var(I) || I <- lists:seq(1, length(MsgDef))].
+
+field_var(I) -> ff("F~w", [I]).
+
+initial_field_values(MsgDef) ->
+    [initial_field_value(FieldDef) || FieldDef <- MsgDef].
+
+initial_field_value(#field{occurrence=repeated}) -> "[]";
+initial_field_value(#field{occurrence=required}) -> undefined;
+initial_field_value(#field{occurrence=optional}) -> undefined.
 
 format_msg_decoder_read_field_par(MsgName, MsgDef) ->
-    ReadFieldCases = format_read_field_cases(MsgName, MsgDef, pass_as_record, x),
-    [f("~p(Bin) ->~n", [mk_fn(d_msg_, MsgName)]),
-     indent(4, f("Msg0 = ~s(),~n", [mk_fn(msg0_, MsgName)])),
-     indent(4, f("~p(Bin, 0, 0, Msg0).~n", [mk_fn(d_read_field_def_, MsgName)])),
-     "\n",
-     f("~p(<<1:1, X:7, Rest/binary>>, N, Acc, Msg) ->~n"
-       "    ~p(Rest, N+7, X bsl N + Acc, Msg);~n",
-       [mk_fn(d_read_field_def_, MsgName),
-        mk_fn(d_read_field_def_, MsgName)]),
-     f("~p(<<0:1, X:7, Rest/binary>>, N, Acc, Msg) ->~n"
-       "    Key = X bsl N + Acc,~n", [mk_fn(d_read_field_def_, MsgName)]),
-     if ReadFieldCases == [] ->
-             f("    case Key band 7 of  %% WireType~n"
-               "        0 -> skip_varint_~s(Rest, Msg);~n"
-               "        1 -> skip_64_~s(Rest, Msg);~n"
-               "        2 -> skip_length_delimited_~s(Rest, 0, 0, Msg);~n"
-               "        5 -> skip_32_~s(Rest, Msg)~n"
-               "    end;~n",
-               [MsgName,MsgName,MsgName,MsgName]);
-        true ->
-             f("    case Key of~n"
-               "~s"
-               "        _ ->~n"
-               "            case Key band 7 of %% wiretype~n"
-               "                0 -> skip_varint_~s(Rest, Msg);~n"
-               "                1 -> skip_64_~s(Rest, Msg);~n"
-               "                2 -> skip_length_delimited_~s(Rest,0,0,Msg);~n"
-               "                5 -> skip_32_~s(Rest, Msg)~n"
-               "            end~n"
-               "    end;~n",
-               [ReadFieldCases,
-                MsgName,MsgName,MsgName,MsgName])
-     end,
-     f("~p(<<>>, 0, 0, Msg) ->~n"
-       "    ~p(Msg).~n~n",
-       [mk_fn(d_read_field_def_, MsgName),
-        mk_fn(d_reverse_toplevel_fields_, MsgName)])].
+    Msg = "Msg",
+    msg_decoder_read_field_cmn(
+      MsgName, MsgDef,
+      [Msg],
+      {assignment, r(MsgName, [{FName, initial_field_value(FieldDef)}
+                               || #field{name=FName}=FieldDef <- MsgDef])},
+      r(Msg, MsgName,
+        [{FName, ff("lists:reverse(~s#~p.~p)", [Msg, MsgName, FName])}
+         || #field{name=FName, occurrence=repeated} <- MsgDef])).
 
-format_read_field_cases(MsgName, MsgDef, FieldPass, FieldVars) ->
-    [begin
-         Wiretype = case is_packed(FieldDef) of
-                        true  -> gpb:encode_wiretype(bytes);
-                        false -> gpb:encode_wiretype(Type)
-                    end,
-         Key = (FNum bsl 3) bor Wiretype,
-         Fill = if FieldPass == pass_as_params -> fill;
-                   FieldPass == pass_as_record -> no_fill
-                end,
-         indent(8, f("~w -> ~p(Rest~s~s);~n",
-                 [Key, mk_fn(d_field_, MsgName, FName),
-                  case mk_field_decoder_vi_params(FieldDef, Fill) of
-                      ""     -> [];
-                      Params -> [", ", Params]
-                  end,
-                  if FieldPass == pass_as_record -> ", Msg";
-                     FieldPass == pass_as_params -> FieldVars
-                  end]))
-     end
-     || #field{fnum=FNum, type=Type, name=FName}=FieldDef <- MsgDef].
+msg_decoder_read_field_cmn(MsgName, MsgDef, Params, Initializer, Finalizer) ->
+    N   = "N",
+    Acc = "Acc",
+    Bin = "Bin",
+    Rest = "Rest",
+    DMsg = mk_fn(d_msg_, MsgName),
+    ReadFieldDef = mk_fn(d_read_field_def_, MsgName),
+    [fn(DMsg, [Bin], '->',
+        case Initializer of
+            {assignment, InitAssignment} ->
+                [ee(["Msg0 = ", InitAssignment]),
+                 call(ReadFieldDef, [Bin, 0, 0, "Msg0"])];
+            {initial_values, InitValues} ->
+                [call(ReadFieldDef, [Bin, 0, 0 | InitValues])]
+        end),
+     '\n'(),
+     fn(ReadFieldDef,
+        [fclause(["<<1:1, X:7, Rest/binary>>", N, Acc | Params], '->',
+                 [call(ReadFieldDef, [Rest, "N+7", "X bsl N + Acc" | Params])]),
+         fclause(["<<0:1, X:7, Rest/binary>>", N, Acc | Params], '->',
+                 [e("Key = X bsl N + Acc"),
+                  if MsgDef == [] ->
+                          mk_skip("Key", MsgName, [Rest, 0, 0 | Params]);
+                     MsgDef /= [] ->
+                          'case'(e("Key"),
+                                 [d_field_call(MsgName, Rest, FieldDef, Params)
+                                  || FieldDef <- MsgDef],
+                                 "_", '->',
+                                 mk_skip("Key", MsgName, [Rest, 0, 0 | Params]))
+                  end]),
+         fclause(["<<>>", 0, 0 | Params], '->',
+                 [Finalizer])]),
+     '\n'()].
 
+d_field_call(MsgName, Rest, #field{name=FName}=FieldDef, Params) ->
+    DField = mk_fn(d_field_, MsgName, FName),
+    Key = key_by_field(FieldDef),
+    {Key, '->', call(DField, [Rest, 0, 0 | Params])}.
+
+key_by_field(#field{fnum=FNum, type=Type}=FieldDef) ->
+    Wiretype = case is_packed(FieldDef) of
+                   true  -> gpb:encode_wiretype(bytes);
+                   false -> gpb:encode_wiretype(Type)
+               end,
+    (FNum bsl 3) bor Wiretype.
+
+mk_skip(Key, MsgName, Params) ->
+    SkipVarint = mk_fn(skip_varint_, MsgName),
+    SkipLength = mk_fn(skip_length_delimited_, MsgName),
+    Skip64 = mk_fn(skip_64_, MsgName),
+    Skip32 = mk_fn(skip_32_, MsgName),
+    'case'(e([Key," band 7"]),
+           [{0, '->', call(SkipVarint, Params)},
+            {1, '->', call(Skip64,     Params)},
+            {2, '->', call(SkipLength, Params)},
+            {5, '->', call(Skip32,     Params)}]).
 
 mk_field_decoder_vi_params(#field{type=Type}=FieldDef, Fill) ->
     case is_packed(FieldDef) of
@@ -1822,7 +1744,7 @@ format_f_field_decoder_pap(MsgName, BitLen, BitType, FieldDef, AnRes) ->
 
 format_f_field_decoder_par(MsgName, BitLen, BitType, FieldDef)  ->
     #field{name=FName}=FieldDef,
-    [f("~p(<<Value:~p/~s, Rest/binary>>, Msg) ->~n",
+    [f("~p(<<Value:~p/~s, Rest/binary>>, _, _, Msg) ->~n",
        [mk_fn(d_field_, MsgName, FName), BitLen, BitType]),
      f("    NewMsg = ~p(Value, Msg),~n", [mk_fn(add_field_, MsgName, FName)]),
      f("    ~p(Rest, 0, 0, NewMsg).~n",
@@ -1859,37 +1781,6 @@ format_dpacked_vi(MsgName, #field{name=FName, type=Type}, Opts) ->
      f("    ~p(~s, 0, 0, [FValue | AccSeq]);~n", [FnName, RestVar]),
      f("~p(<<>>, 0, 0, AccSeq) ->~n", [FnName]),
      f("    AccSeq.~n~n")].
-
-format_msg_decoder_reverse_toplevel(MsgName, MsgDef, AnRes) ->
-    case get_field_pass(MsgName, AnRes) of
-        pass_as_params -> ""; %% handled in d_read_field_def_<Msg>
-        pass_as_record -> format_msg_decoder_reverse_toplevel_par(MsgName,MsgDef)
-    end.
-
-format_msg_decoder_reverse_toplevel_par(MsgName, MsgDef) ->
-    MsgNameQLen = flength("~p", [MsgName]),
-    FieldsToReverse = [F || F <- MsgDef, F#field.occurrence == repeated],
-    if FieldsToReverse /= [] ->
-            FieldMatchings =
-                outdent_first(
-                  string:join(
-                    [indent(8+2+MsgNameQLen, f("~p=F~s", [FName, FName]))
-                     || #field{name=FName} <- FieldsToReverse],
-                    ",\n")),
-            FieldReversings =
-                outdent_first(
-                  string:join(
-                    [indent(8+2+MsgNameQLen, f("~p=lists:reverse(F~s)",
-                                               [FName, FName]))
-                     || #field{name=FName} <- FieldsToReverse],
-                    ",\n")),
-            [f("~p(~n", [mk_fn(d_reverse_toplevel_fields_, MsgName)]),
-             indent(8, f("#~p{~s}=Msg) ->~n", [MsgName, FieldMatchings])),
-             indent(4, f("Msg#~p{~s}.~n~n", [MsgName, FieldReversings]))];
-       true ->
-            [f("~p(Msg) ->~n", [mk_fn(d_reverse_toplevel_fields_, MsgName)]),
-             indent(4, f("Msg.~n~n"))]
-    end.
 
 format_field_adders(MsgName, MsgDef, AnRes) ->
     case get_field_pass(MsgName, AnRes) of
@@ -2018,21 +1909,16 @@ occurs_as_optional_submsg(MsgName, #anres{msg_occurrences=Occurrences}=AnRes) ->
         lists:member(optional, dict:fetch(MsgName, Occurrences)).
 
 format_field_skippers(MsgName, AnRes) ->
-    case get_field_pass(MsgName, AnRes) of
-        pass_as_params ->
-            NF = get_num_fields(MsgName, AnRes),
-            [format_varint_skipper_pap(MsgName, NF),
-             format_length_delimited_skipper_pap(MsgName, NF),
-             format_bit_skipper_pap(MsgName, 32, NF),
-             format_bit_skipper_pap(MsgName, 64, NF)];
-        pass_as_record ->
-            [format_varint_skipper_par(MsgName),
-             format_length_delimited_skipper_par(MsgName),
-             format_bit_skipper_par(MsgName, 32),
-             format_bit_skipper_par(MsgName, 64)]
-    end.
+    NF = case get_field_pass(MsgName, AnRes) of
+             pass_as_params -> get_num_fields(MsgName, AnRes);
+             pass_as_record -> 1
+         end,
+    [format_varint_skipper(MsgName, NF),
+     format_length_delimited_skipper(MsgName, NF),
+     format_bit_skipper(MsgName, 32, NF),
+     format_bit_skipper(MsgName, 64, NF)].
 
-format_varint_skipper_pap(MsgName, NF) ->
+format_varint_skipper(MsgName, NF) ->
     SkipFn = mk_fn(skip_varint_, MsgName),
     ReadFieldFn = mk_fn(d_read_field_def_, MsgName),
     PassFieldVars = [f(", F~w", [I]) || I <- lists:seq(1,NF)],
@@ -2041,14 +1927,7 @@ format_varint_skipper_pap(MsgName, NF) ->
      f("~p(<<1:1, _:7, Rest/binary>>, X1, X2~s) ->~n", [SkipFn, PassFieldVars]),
      f("    ~p(Rest, X1, X2~s).~n~n", [SkipFn, PassFieldVars])].
 
-format_varint_skipper_par(MsgName) ->
-    SkipFn = mk_fn(skip_varint_, MsgName),
-    [f("~p(<<0:1, _:7, Rest/binary>>, Msg) ->~n", [SkipFn]),
-     f("    ~p(Rest, 0, 0, Msg);~n", [mk_fn(d_read_field_def_, MsgName)]),
-     f("~p(<<1:1, _:7, Rest/binary>>, Msg) ->~n", [SkipFn]),
-     f("    ~p(Rest, Msg).~n~n", [SkipFn])].
-
-format_length_delimited_skipper_pap(MsgName, NF) ->
+format_length_delimited_skipper(MsgName, NF) ->
     SkipFn = mk_fn(skip_length_delimited_, MsgName),
     ReadFieldFn = mk_fn(d_read_field_def_, MsgName),
     PassFieldVars = [f(", F~w", [I]) || I <- lists:seq(1,NF)],
@@ -2059,27 +1938,13 @@ format_length_delimited_skipper_pap(MsgName, NF) ->
      f("    <<_:Length/binary, Rest2/binary>> = Rest,~n"),
      f("    ~p(Rest2, 0, 0~s).~n~n", [ReadFieldFn, PassFieldVars])].
 
-format_length_delimited_skipper_par(MsgName) ->
-    SkipFn = mk_fn(skip_length_delimited_, MsgName),
-    [f("~p(<<1:1, X:7, Rest/binary>>, N, Acc, Msg) ->~n", [SkipFn]),
-     f("    ~p(Rest, N+7, X bsl N + Acc, Msg);~n", [SkipFn]),
-     f("~p(<<0:1, X:7, Rest/binary>>, N, Acc, Msg) ->~n", [SkipFn]),
-     f("    Length = X bsl N + Acc,~n"),
-     f("    <<_:Length/binary, Rest2/binary>> = Rest,~n"),
-     f("    ~p(Rest2, 0, 0, Msg).~n~n", [mk_fn(d_read_field_def_, MsgName)])].
-
-format_bit_skipper_pap(MsgName, BitLen, NF) ->
+format_bit_skipper(MsgName, BitLen, NF) ->
     SkipFn = mk_fn(skip_, BitLen, MsgName),
     ReadFieldFn = mk_fn(d_read_field_def_, MsgName),
     PassFieldVars = [f(", F~w", [I]) || I <- lists:seq(1,NF)],
     [f("~p(<<_:~w, Rest/binary>>, _, _~s) ->~n",
        [SkipFn, BitLen, PassFieldVars]),
      f("    ~p(Rest, 0, 0~s).~n~n",  [ReadFieldFn, PassFieldVars])].
-
-format_bit_skipper_par(MsgName, BitLen) ->
-    SkipFn = mk_fn(skip_, BitLen, MsgName),
-    [f("~p(<<_:~w, Rest/binary>>, Msg) ->~n", [SkipFn, BitLen]),
-     f("    ~p(Rest, 0, 0, Msg).~n~n",  [mk_fn(d_read_field_def_, MsgName)])].
 
 %% -- verifiers -----------------------------------------------------
 
@@ -2484,12 +2349,6 @@ lineup(CurrentCol, TargetCol) when CurrentCol < TargetCol ->
 lineup(_, _) ->
     " ".
 
-indent(Indent, Str) ->
-    lists:duplicate(Indent, $\s) ++ Str.
-
-indent_lines(Indent, Lines) ->
-    [indent(Indent, Line) || Line <- Lines].
-
 outdent_first(IoList) ->
     lists:dropwhile(fun(C) -> C == $\s end,
                     binary_to_list(iolist_to_binary(IoList))).
@@ -2567,6 +2426,150 @@ gpb_field_to_record_field(#field{name=FName, opts=Opts}) ->
         Default   -> {FName, Default}
     end.
 
+%% -- internal formatting utilities ------------------------------------------
+
+
+%% A function
+fn(FunctionName, Clauses) ->
+    [string:join([f("~p~s", [FunctionName, Clause]) || Clause <- Clauses],
+                 f(";~n")),
+     f(".~n")].
+
+fn(FunctionName, Args, '->', BodyExprs) ->
+    fn(FunctionName, [fclause(Args, '->', BodyExprs)]).
+
+fclause(Args, '->', BodyExprs) ->
+    f("(~s) ->~n~s", [format_fn_arg_list(Args), format_body(BodyExprs)]).
+
+call(FunctionName, Args) ->
+    {call, FunctionName, Args}.
+
+format_fn_arg_list(Args) ->
+    string:join([stringify(X) || X <- Args], ", ").
+
+stringify("") -> "";
+stringify(A) when is_atom(A) -> atom_to_list(A);
+stringify(I) when is_integer(I) -> integer_to_list(I);
+stringify(X) ->
+    case io_lib:printable_list(X) of
+        true  -> X;
+        false -> format_fn_arg_list(X) %% a sub-list
+    end.
+
+'case'(Expr, Cases) ->
+    {'case', Expr, Cases}.
+
+'case'(Expr, Cases, LastCond, '->', LastRes) ->
+    'case'(Expr, Cases ++ [{LastCond, '->', LastRes}]).
+
+
+%% Record creation
+r(RecordName, Fields) -> {record, RecordName, Fields}.
+%% Record update
+r(Var, RecordName, Fields) -> {r_update, Var, RecordName, Fields}.
+
+e(Txt)       -> {e, f(Txt)}.
+%e(Fmt, Args) -> {e, f(Fmt, Args)}.
+
+%% A list of (pre-formatted) expression fragments -- text | {r,_,_} or similar
+%% normally fitting one line or a few lines
+ee(ExprFragments) ->
+    {e, ExprFragments}.
+
+format_body(BodyExprs) ->
+    format_body(BodyExprs, _InitialIndent=4).
+
+%% Newline characters are added only here as the very last step
+format_body([Expr | RestExprs], Indent) when RestExprs /= [] ->
+    [[format_expr(Indent, Expr), ","++'\n'()] | format_body(RestExprs, Indent)];
+format_body([Expr], Indent) ->
+    format_expr(Indent, Expr).
+
+%% About the indent:
+%% Indent = IndentForAllLines | cons(IndentForFirstLine, IndentForRestOfLines)
+%%
+%%          IndentForAllLines = integer()
+%%          IndentForFirstLine = IndentForRestOfLines = integer()
+format_expr(Indent, {e, ExprFragments}) ->
+    [Indent1 | IndentRest] = split_indent(Indent),
+    {Res, _} =
+        lists:mapfoldl(fun(Frag, CurrIndent) ->
+                               FragTxt = format_expr([0|CurrIndent+4], Frag),
+                               Indent2 = update_curr_indent(CurrIndent,FragTxt),
+                               {FragTxt, Indent2}
+                       end,
+                       IndentRest,
+                       ExprFragments),
+    [indent(Indent1, Res)];
+format_expr(Indent, {'case', Expr, Cases}) ->
+    [Indent1 | IndentRest] = split_indent(Indent),
+    [f(Indent1, "case ~s of~n", [format_expr([0|Indent1+4], Expr)]),
+     string:join(
+       [case is_one_line_expr(Res) of
+            true ->
+                f(IndentRest+4, "~s -> ~s",
+                  [stringify(Cond), format_expr(0, Res)]);
+            _Other ->
+                f(IndentRest+4, "~s ->~n~s",
+                  [stringify(Cond), format_expr(IndentRest+8, Res)])
+        end
+        || {Cond, '->', Res} <- Cases],
+       ";"++'\n'()),
+     '\n'(),
+     f(IndentRest, "end")];
+format_expr(Indent, {call, Fn, Args}) ->
+    [Indent1 | _] = split_indent(Indent),
+    f(Indent1, "~p(~s)", [Fn, format_fn_arg_list(Args)]);
+format_expr(Indent, {record, RecordName, Fields}) ->
+    NoVar = "",
+    format_expr(Indent, {r_update, NoVar, RecordName, Fields});
+format_expr(Indent, {r_update, Var, RecordName, Fields}) ->
+    [Indent1 | IndentRest] = split_indent(Indent),
+    ExtraIndent = flength("~s#~p{", [Var, RecordName]),
+    Sep = f(",~n~*s", [IndentRest + ExtraIndent, ""]),
+    FieldsTxt = string:join([f("~p = ~s", [Field, format_expr(0, Value)])
+                             || {Field, Value} <- Fields],
+                            Sep),
+    f(Indent1, "~s#~p{~s}", [Var, RecordName, FieldsTxt]);
+format_expr(Indent, C) when is_integer(C) ->
+    [Indent1 | _] = split_indent(Indent),
+    indent(Indent1, [C]);
+format_expr(Indent, Atom) when is_atom(Atom) ->
+    [Indent1 | _] = split_indent(Indent),
+    indent(Indent1, f("~p", [Atom]));
+format_expr(Indent, X) ->
+    [Indent1 | _] = split_indent(Indent),
+    case io_lib:printable_list(X) of
+        true  -> indent(Indent1, X);
+        false -> erlang:error({illegal_expr, X})
+    end.
+
+split_indent(I) when is_integer(I) -> [I|I];
+split_indent([_I1 | _IRest]=I)     -> I.
+
+is_one_line_expr({e,_})        -> true;
+is_one_line_expr({call,_,_})   -> true;
+is_one_line_expr({record,_,_}) -> false;
+is_one_line_expr({'case',_,_}) -> false;
+is_one_line_expr(_)            -> false.
+
+update_curr_indent(I, []) ->
+    I;
+update_curr_indent(_, [$\n | Tl])  ->
+    update_curr_indent(0, Tl);
+update_curr_indent(I, [Char | Tl]) when is_integer(Char) ->
+    update_curr_indent(I+1, Tl);
+update_curr_indent(I, [IoSubList | Tl]) when is_list(IoSubList) ->
+    update_curr_indent(update_curr_indent(I, IoSubList)+1, Tl).
+
+'\n'() -> f("~n"). %% possibly platform dependent??
+
+indent_lines(Indent, Lines) ->
+    [indent(Indent, Line) || Line <- Lines].
+
+indent(Indent, Str) ->
+    [lists:duplicate(Indent, $\s), Str].
+
 %% -- internal utilities -----------------------------------------------------
 
 is_packed(#field{opts=Opts}) ->
@@ -2588,8 +2591,13 @@ smember_any(Elems, Set) -> %% is any elem a member in the set
 index_seq([]) -> [];
 index_seq(L)  -> lists:zip(lists:seq(1,length(L)), L).
 
-f(F)   -> f(F,[]).
-f(F,A) -> io_lib:format(F,A).
+
+f(F)   when is_list(F) -> f(F,[]).
+f(F,A) when is_list(F) -> io_lib:format(F,A);
+f(Indent, F)   when is_integer(Indent) -> indent(Indent, f(F)).
+f(Indent, F,A) when is_integer(Indent) -> indent(Indent, ff(F, A)).
+
+ff(F, A) -> lists:flatten(f(F, A)).
 
 %flength(F) -> iolist_size(f(F)).
 flength(F, A) -> iolist_size(f(F, A)).
