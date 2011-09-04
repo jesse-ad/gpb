@@ -1329,6 +1329,12 @@ initial_field_value(#field{occurrence=repeated}) -> "[]";
 initial_field_value(#field{occurrence=required}) -> undefined;
 initial_field_value(#field{occurrence=optional}) -> undefined.
 
+change_field_var(Index, FieldVars, NewValue) ->
+    [if I == Index -> NewValue;
+        I /= Index -> FieldVar
+     end
+     || {I, FieldVar} <- index_seq(FieldVars)].
+
 format_msg_decoder_read_field_par(MsgName, MsgDef) ->
     Msg = "Msg",
     msg_decoder_read_field_cmn(
@@ -1524,47 +1530,48 @@ format_vi_based_field_decoder(MsgName, FieldDef, AnRes, Opts) ->
 format_vi_based_field_decoder_pap(MsgName, FieldDef, AnRes, Opts) ->
     NF = get_num_fields(MsgName, AnRes),
     #field{type=Type, rnum=RNum, name=FName}=FieldDef,
+    FieldVars = [field_var(I) || I <- lists:seq(1, NF)],
+    FNum = RNum - 1,
+    FVar = field_var(FNum),
+    FValue = "FValue",
+    FValue2 = "FValue2",
+    N = "N",
+    Acc = "Acc",
+    Rest = "Rest",
     Merge = classify_field_merge_action(FieldDef),
-    PassFieldVars = [[", ", f("F~w", [I])] || I <- lists:seq(1, NF)],
-    InFieldVars = [[", ", if I == RNum-1, Merge == overwrite -> "_";
-                             I == RNum-1, Merge == seqadd    -> f("F~w", [I]);
-                             I == RNum-1, Merge == msgmerge  -> f("F~w", [I]);
-                             I /= RNum-1                     -> f("F~w", [I])
-                          end]
-                   || I <- lists:seq(1, NF)],
-    MergeCode = case Merge of
-                    overwrite -> "";
-                    seqadd    -> f("    FValue2 = [FValue | F~w],~n", [RNum-1]);
-                    msgmerge  -> {msg,FMsgName} = Type,
-                                 f("    FValue2 = if F~w == undefined ->~n"
-                                   "                     FValue;~n"
-                                   "                 true ->~n"
-                                   "                     ~p(F~w, FValue)~n"
-                                   "              end,~n",
-                                   [RNum-1,
-                                    mk_fn(merge_msg_, FMsgName), RNum-1])
-                end,
-    OutFieldVars = [[", ", if I == RNum-1, Merge == overwrite -> "FValue";
-                              I == RNum-1, Merge == seqadd    -> "FValue2";
-                              I == RNum-1, Merge == msgmerge  -> "FValue2";
-                              I /= RNum-1                     -> f("F~w", [I])
-                           end]
-                    || I <- lists:seq(1, NF)],
+    InFieldVars = case Merge of
+                      overwrite -> change_field_var(FNum, FieldVars, '_');
+                      _         -> FieldVars
+                  end,
     BValueExpr = "X bsl N + Acc",
-    {FValueCode, RestVar} = mk_unpack_vi(4, "FValue", BValueExpr, Type, "Rest",
-                                         Opts),
-    [f("~p(<<1:1, X:7, Rest/binary>>, N, Acc~s) ->~n"
-       "    ~p(Rest, N+7, X bsl N + Acc~s);~n",
-       [mk_fn(d_field_, MsgName, FName), PassFieldVars,
-        mk_fn(d_field_, MsgName, FName), PassFieldVars]),
-     f("~p(<<0:1, X:7, Rest/binary>>, N, Acc~s) ->~n",
-       [mk_fn(d_field_, MsgName, FName), InFieldVars]),
-     f("~s",
-       [FValueCode]),
-     f("~s",
-       [MergeCode]),
-     f("    ~p(~s, 0, 0~s).~n",
-       [mk_fn(d_read_field_def_, MsgName), RestVar, OutFieldVars])].
+    {FValueCode, Rest2} = unpack_vi_code(FValue, BValueExpr, Type, Rest, Opts),
+    MergeCode =
+        case Merge of
+            overwrite ->
+                [nop];
+            seqadd ->
+                [e("FValue2 = [FValue | "++FVar++"]")];
+            msgmerge ->
+                {msg,FMsgName} = Type,
+                MsgMergeFn = mk_fn(merge_msg_, FMsgName),
+                [ee(["FValue2 = ",
+                     'if'([{FVar++" == undefined", '->', e(FValue)},
+                           {true, '->', call(MsgMergeFn, [FVar, FValue])}])])]
+        end,
+    OutFieldVars = case Merge of
+                       overwrite -> change_field_var(FNum, FieldVars, FValue);
+                       seqadd    -> change_field_var(FNum, FieldVars, FValue2);
+                       msgmerge  -> change_field_var(FNum, FieldVars, FValue2)
+                   end,
+    FnName = mk_fn(d_field_, MsgName, FName),
+    ReadFieldDef = mk_fn(d_read_field_def_, MsgName),
+    fn(FnName,
+       [fclause(["<<1:1, X:7, Rest/binary>>", N, Acc | FieldVars], '->',
+                [call(FnName, [Rest, "N+7", "X bsl N + Acc" | FieldVars])]),
+        fclause(["<<0:1, X:7, Rest/binary>>", N, Acc | InFieldVars], '->',
+                FValueCode ++
+                    MergeCode ++
+                    [call(ReadFieldDef, [Rest2, 0, 0 | OutFieldVars])])]).
 
 format_vi_based_field_decoder_par(MsgName, FieldDef, Opts) ->
     #field{type=Type, name=FName}=FieldDef,
@@ -1583,7 +1590,86 @@ format_vi_based_field_decoder_par(MsgName, FieldDef, Opts) ->
      f("    ~p(~s, 0, 0, NewMsg).~n",
        [mk_fn(d_read_field_def_, MsgName), RestVar])].
 
-%% -> {FValueCode, Rest2Var}
+%% -> {FValueCode, Rest2}
+unpack_vi_code(FValue, BValueExpr, Type, Rest, Opts) ->
+    Rest2 = Rest ++ "2",
+    case Type of
+        sint32 ->
+            {[e("BValue = ~s", [BValueExpr]),
+              ee([FValue++" = ", decode_zigzag_code("BValue")])],
+             Rest};
+        sint64 ->
+            {[e("BValue = ~s", [BValueExpr]),
+              ee([FValue++" = ", decode_zigzag_code("BValue")])],
+             Rest};
+        int32 ->
+            {[uint_to_int_code(BValueExpr, FValue, 32)], Rest};
+        int64 ->
+            {[uint_to_int_code(BValueExpr, FValue, 64)], Rest};
+        uint32 ->
+            {[e("~s = ~s", [FValue, BValueExpr])], Rest};
+        uint64 ->
+            {[e("~s = ~s", [FValue, BValueExpr])], Rest};
+        bool ->
+            {[e("~s = (~s) =/= 0", [FValue, BValueExpr])], Rest};
+        {enum, EnumName} ->
+            EnumValue = "EnumValue",
+            EnumDecodeFn = mk_fn(d_enum_, EnumName),
+            {[uint_to_int_code(BValueExpr, EnumValue, 64),
+              ee([FValue ++ " = ", call(EnumDecodeFn, [EnumValue])])],
+             Rest};
+        string ->
+            {[e("Len = ~s", [BValueExpr]),
+              e("<<Utf8:Len/binary, ~s/binary>> = ~s", [Rest2, Rest]),
+              e("~s = unicode:characters_to_list(Utf8,unicode)", [FValue])],
+             Rest2};
+        bytes ->
+            {[e("Len = ~s", [BValueExpr]) |
+              unpack_bytes_code(FValue, Rest, Rest2, Opts)],
+             Rest2};
+        {msg,Msg2Name} ->
+            {[e("Len = ~s", [BValueExpr]),
+              e("<<MsgBytes:Len/binary, ~s/binary>> = ~s", [Rest2, Rest]),
+              e("~s = decode_msg(MsgBytes, ~p)", [FValue, Msg2Name])],
+             Rest2}
+    end.
+
+
+decode_zigzag_code(Var) ->
+    'if'([{e("~s band 1 =:= 0", [Var]), '->', e("~s bsr 1", [Var])},
+          {true,                        '->', e("-((~s + 1) bsr 1)", [Var])}]).
+
+uint_to_int_code(SrcStr, ResultVar, NumBits) ->
+    e("<<~s:~w/signed-native>> = <<(~s):~p/unsigned-native>>",
+      [ResultVar, NumBits, SrcStr, NumBits]).
+
+unpack_bytes_code(FValue, Rest, Rest2, Opts) ->
+    CompilerHasBinary = (catch binary:copy(<<1>>)) == <<1>>,
+    Copy = case proplists:get_value(copy_bytes, Opts, auto) of
+               auto when not CompilerHasBinary -> false;
+               auto when CompilerHasBinary     -> true;
+               true                            -> true;
+               false                           -> false;
+               N when is_integer(N)            -> N;
+               N when is_float(N)              -> N
+           end,
+    if Copy == false ->
+            [e("<<~s:Len/binary, ~s/binary>> = ~s", [FValue, Rest2, Rest])];
+       Copy == true ->
+            [e("<<Bytes:Len/binary, ~s/binary>> = ~s", [Rest2, Rest]),
+             e("~s = binary:copy(Bytes)", [FValue])];
+       is_integer(Copy); is_float(Copy) ->
+            Bytes = "Bytes",
+            [e("<<Bytes:Len/binary, ~s/binary>> = ~s", [Rest2, Rest]),
+             ee([FValue ++ " = ",
+                 'case'("binary:referenced_byte_size(Bytes)",
+                        [{"LB", 'when',
+                          ff("LB >= byte_size(Bytes) * ~w", [Copy]), '->',
+                          e("binary:copy(Bytes)")},
+                         {'_', '->', ee([Bytes])}])])]
+    end.
+
+%% -> {FValueCode, Rest2}
 %% Produce code for setting a variable, FValueVar, depending on the
 %% varint type Type, for the raw unpacked expr, BValueExpr.
 %%
@@ -2431,21 +2517,23 @@ gpb_field_to_record_field(#field{name=FName, opts=Opts}) ->
 
 %% A function
 fn(FunctionName, Clauses) ->
-    [string:join([f("~p~s", [FunctionName, Clause]) || Clause <- Clauses],
-                 f(";~n")),
-     f(".~n")].
+    try
+        %% io:format("FN ~p~n    ~p~n", [FunctionName, Clauses]),
+        format_fn(FunctionName, Clauses)
+    catch Class:Reason ->
+            StackTrace = erlang:get_stacktrace(),
+            NewReason =  {bad_fn_format, {FunctionName,Clauses}, Reason},
+            erlang:raise(Class, NewReason, StackTrace)
+    end.
 
 fn(FunctionName, Args, '->', BodyExprs) ->
     fn(FunctionName, [fclause(Args, '->', BodyExprs)]).
 
 fclause(Args, '->', BodyExprs) ->
-    f("(~s) ->~n~s", [format_fn_arg_list(Args), format_body(BodyExprs)]).
+    {fclause, Args, '->', BodyExprs}.
 
 call(FunctionName, Args) ->
     {call, FunctionName, Args}.
-
-format_fn_arg_list(Args) ->
-    string:join([stringify(X) || X <- Args], ", ").
 
 stringify("") -> "";
 stringify(A) when is_atom(A) -> atom_to_list(A);
@@ -2462,6 +2550,8 @@ stringify(X) ->
 'case'(Expr, Cases, LastCond, '->', LastRes) ->
     'case'(Expr, Cases ++ [{LastCond, '->', LastRes}]).
 
+'if'(Clauses) ->
+    {'if', Clauses}.
 
 %% Record creation
 r(RecordName, Fields) -> {record, RecordName, Fields}.
@@ -2469,21 +2559,39 @@ r(RecordName, Fields) -> {record, RecordName, Fields}.
 r(Var, RecordName, Fields) -> {r_update, Var, RecordName, Fields}.
 
 e(Txt)       -> {e, f(Txt)}.
-%e(Fmt, Args) -> {e, f(Fmt, Args)}.
+e(Fmt, Args) -> {e, f(Fmt, Args)}.
 
 %% A list of (pre-formatted) expression fragments -- text | {r,_,_} or similar
 %% normally fitting one line or a few lines
 ee(ExprFragments) ->
     {e, ExprFragments}.
 
+format_fn(FunctionName, Clauses) ->
+    [string:join([f("~p~s", [FunctionName, format_fclause(Clause)])
+                  || Clause <- Clauses],
+                 f(";~n")),
+     f(".~n")].
+
+format_fclause({fclause, Args, '->', BodyExprs}) ->
+    f("(~s) ->~n~s", [format_fn_arg_list(Args), format_body(BodyExprs)]).
+
+format_fn_arg_list(Args) ->
+    string:join([stringify(X) || X <- Args], ", ").
+
+
 format_body(BodyExprs) ->
-    format_body(BodyExprs, _InitialIndent=4).
+    format_exprs(_InitialIndent=4, BodyExprs).
 
 %% Newline characters are added only here as the very last step
-format_body([Expr | RestExprs], Indent) when RestExprs /= [] ->
-    [[format_expr(Indent, Expr), ","++'\n'()] | format_body(RestExprs, Indent)];
-format_body([Expr], Indent) ->
-    format_expr(Indent, Expr).
+format_exprs(Indent, Exprs) ->
+    [_Indent1 | IndentRest] = split_indent(Indent),
+    Sep = "," ++ '\n'() ++ indent(IndentRest, ""),
+    string:join([format_expr(Indent, Expr) || Expr <- flatten_if_list(Exprs),
+                                              Expr /= nop],
+                Sep).
+
+flatten_if_list(L) when is_list(L) -> lists:flatten(L);
+flatten_if_list(Expr)              -> [Expr].
 
 %% About the indent:
 %% Indent = IndentForAllLines | cons(IndentForFirstLine, IndentForRestOfLines)
@@ -2501,20 +2609,52 @@ format_expr(Indent, {e, ExprFragments}) ->
                        IndentRest,
                        ExprFragments),
     [indent(Indent1, Res)];
-format_expr(Indent, {'case', Expr, Cases}) ->
+format_expr(Indent, {'if',  Clauses}) ->
     [Indent1 | IndentRest] = split_indent(Indent),
-    [f(Indent1, "case ~s of~n", [format_expr([0|Indent1+4], Expr)]),
+    IfClausesSep = ";" ++ '\n'() ++ indent(IndentRest+3, ""),
+    [f(Indent1, "if "),
      string:join(
        [case is_one_line_expr(Res) of
             true ->
-                f(IndentRest+4, "~s -> ~s",
-                  [stringify(Cond), format_expr(0, Res)]);
-            _Other ->
-                f(IndentRest+4, "~s ->~n~s",
-                  [stringify(Cond), format_expr(IndentRest+8, Res)])
+                f("~s -> ~s",
+                  [format_expr(0, Test), format_exprs(0, Res)]);
+            false ->
+                f("~s -> ~n~s",
+                  [format_expr(0, Test), format_exprs(IndentRest+7, Res)])
         end
-        || {Cond, '->', Res} <- Cases],
-       ";"++'\n'()),
+        || {Test, '->', Res} <- Clauses],
+       IfClausesSep),
+     '\n'(),
+     f(IndentRest, "end")];
+format_expr(Indent, {'case', Expr, Cases}) ->
+    [Indent1 | IndentRest] = split_indent(Indent),
+    CaseClauseSep = ";" ++ '\n'() ++ indent(IndentRest, ""),
+    [f(Indent1, "case ~s of~n", [format_expr([0|Indent1+4], Expr)]),
+     string:join(
+       [case Case of
+            {Cond, '->', Res} ->
+                case is_one_line_expr(Res) of
+                    true ->
+                        f(IndentRest+4, "~s -> ~s",
+                          [stringify(Cond), format_exprs(0, Res)]);
+                    _Other ->
+                        f(IndentRest+4, "~s ->~n~s",
+                          [stringify(Cond), format_exprs(IndentRest+8, Res)])
+                end;
+            {Cond, 'when', Guard, '->', Res} ->
+                case is_one_line_expr(Res) of
+                    true ->
+                        f(IndentRest+4, "~s when ~s -> ~s",
+                          [stringify(Cond), format_expr(0, Guard),
+                           format_exprs(0, Res)]);
+                    _Other ->
+                        f(IndentRest+4, "~s when ~s ->~n~s",
+                          [stringify(Cond), format_expr(0, Guard),
+                           format_exprs(IndentRest+8, Res)])
+                end
+        end
+        || Case <- Cases],
+       CaseClauseSep),
      '\n'(),
      f(IndentRest, "end")];
 format_expr(Indent, {call, Fn, Args}) ->
@@ -2526,7 +2666,7 @@ format_expr(Indent, {record, RecordName, Fields}) ->
 format_expr(Indent, {r_update, Var, RecordName, Fields}) ->
     [Indent1 | IndentRest] = split_indent(Indent),
     ExtraIndent = flength("~s#~p{", [Var, RecordName]),
-    Sep = f(",~n~*s", [IndentRest + ExtraIndent, ""]),
+    Sep = "," ++ '\n'() ++ indent(IndentRest + ExtraIndent, ""),
     FieldsTxt = string:join([f("~p = ~s", [Field, format_expr(0, Value)])
                              || {Field, Value} <- Fields],
                             Sep),
