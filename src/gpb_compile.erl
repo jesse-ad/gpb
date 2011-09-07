@@ -1615,7 +1615,7 @@ unpack_vi_code(FValue, BValueExpr, Type, Rest, Opts) ->
         {enum, EnumName} ->
             EnumValue = "EnumValue",
             EnumDecodeFn = mk_fn(d_enum_, EnumName),
-            {[uint_to_int_code(BValueExpr, EnumValue, 64),
+            {[uint_to_int_code(BValueExpr, EnumValue, 32),
               ee([FValue ++ " = ", call(EnumDecodeFn, [EnumValue])])],
              Rest};
         string ->
