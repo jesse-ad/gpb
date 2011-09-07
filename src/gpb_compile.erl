@@ -1294,7 +1294,6 @@ format_msg_decoders(Defs, AnRes, Opts) ->
 format_msg_decoder(MsgName, MsgDef, AnRes, Opts) ->
     [format_msg_decoder_read_field(MsgName, MsgDef, AnRes),
      format_field_decoders(MsgName, MsgDef, AnRes, Opts),
-     format_field_adders(MsgName, MsgDef, AnRes),
      format_field_skippers(MsgName, AnRes)].
 
 format_msg_decoder_read_field(MsgName, MsgDef, AnRes) ->
@@ -1574,21 +1573,51 @@ format_vi_based_field_decoder_pap(MsgName, FieldDef, AnRes, Opts) ->
                     [call(ReadFieldDef, [Rest2, 0, 0 | OutFieldVars])])]).
 
 format_vi_based_field_decoder_par(MsgName, FieldDef, Opts) ->
-    #field{type=Type, name=FName}=FieldDef,
+    #field{type=Type, rnum=RNum, name=FName}=FieldDef,
+    FNum = RNum - 1,
+    FVar = field_var(FNum),
+    FValue = "FValue",
+    FValue2 = "FValue2",
+    N = "N",
+    Acc = "Acc",
+    Rest = "Rest",
+    Msg = "Msg",
+    Merge = classify_field_merge_action(FieldDef),
+    InVar = case Merge of
+                overwrite -> Msg;
+                seqadd    -> ff("#~p{~p=~s}=Msg", [MsgName, FName, FVar]);
+                msgmerge  -> ff("#~p{~p=~s}=Msg", [MsgName, FName, FVar])
+            end,
     BValueExpr = "X bsl N + Acc",
-    {FValueCode, RestVar} = mk_unpack_vi(4, "FValue", BValueExpr, Type, "Rest",
-                                         Opts),
-    [f("~p(<<1:1, X:7, Rest/binary>>, N, Acc, Msg) ->~n"
-       "    ~p(Rest, N+7, X bsl N + Acc, Msg);~n",
-       [mk_fn(d_field_, MsgName, FName),
-        mk_fn(d_field_, MsgName, FName)]),
-     f("~p(<<0:1, X:7, Rest/binary>>, N, Acc, Msg) ->~n",
-       [mk_fn(d_field_, MsgName, FName)]),
-     f("~s",
-       [FValueCode]),
-     f("    NewMsg = ~p(FValue, Msg),~n", [mk_fn(add_field_, MsgName, FName)]),
-     f("    ~p(~s, 0, 0, NewMsg).~n",
-       [mk_fn(d_read_field_def_, MsgName), RestVar])].
+    {FValueCode, Rest2} = unpack_vi_code(FValue, BValueExpr, Type, Rest, Opts),
+    MergeCode =
+        case Merge of
+            overwrite ->
+                [nop];
+            seqadd ->
+                [e("FValue2 = [FValue | "++FVar++"]")];
+            msgmerge ->
+                {msg,FMsgName} = Type,
+                MsgMergeFn = mk_fn(merge_msg_, FMsgName),
+                [ee(["FValue2 = ",
+                     'if'([{FVar++" == undefined", '->', e(FValue)},
+                           {true, '->', call(MsgMergeFn, [FVar, FValue])}])])]
+        end,
+    Out = case Merge of
+              overwrite -> ff("~s#~p{~p=~s}", [Msg, MsgName, FName, FValue]);
+              seqadd    -> ff("~s#~p{~p=~s}", [Msg, MsgName, FName, FValue2]);
+              msgmerge  -> ff("~s#~p{~p=~s}", [Msg, MsgName, FName, FValue2])
+          end,
+    FnName = mk_fn(d_field_, MsgName, FName),
+    ReadFieldDef = mk_fn(d_read_field_def_, MsgName),
+    fn(FnName,
+       [fclause(["<<1:1, X:7, Rest/binary>>", N, Acc, Msg], '->',
+                [call(FnName, [Rest, "N+7", "X bsl N + Acc", Msg])]),
+        fclause(["<<0:1, X:7, Rest/binary>>", N, Acc, InVar], '->',
+                FValueCode ++
+                    MergeCode ++
+                    [call(ReadFieldDef, [Rest2, 0, 0, Out])])]).
+
 
 %% -> {FValueCode, Rest2}
 unpack_vi_code(FValue, BValueExpr, Type, Rest, Opts) ->
@@ -1806,35 +1835,59 @@ format_f_field_decoder(MsgName, BitLen, BitType, FieldDef, AnRes) ->
 format_f_field_decoder_pap(MsgName, BitLen, BitType, FieldDef, AnRes) ->
     NF = get_num_fields(MsgName, AnRes),
     #field{rnum=RNum, name=FName}=FieldDef,
+    FNum = RNum - 1,
+    FVar = field_var(FNum),
+    Rest = "Rest",
+    Value = "Value",
+    Value2 = "Value2",
+    FieldVars = [field_var(I) || I <- lists:seq(1, NF)],
     Merge = classify_field_merge_action(FieldDef),
-    InFieldVars = [[", ", if I == RNum-1, Merge == overwrite -> "_";
-                             I == RNum-1, Merge == seqadd    -> f("F~w", [I]);
-                             I /= RNum-1                     -> f("F~w", [I])
-                          end]
-                   || I <- lists:seq(1, NF)],
+    InFieldVars = case Merge of
+                      overwrite -> change_field_var(FNum, FieldVars, '_');
+                      seqadd    -> FieldVars
+                  end,
     MergeCode = case Merge of
-                    overwrite -> "";
-                    seqadd    -> f("    Value2 = [Value | F~w],~n", [RNum-1])
+                    overwrite -> [nop];
+                    seqadd    -> [e("Value2 = [Value | "++FVar++"]")]
                 end,
-    OutFieldVars = [[", ", if I == RNum-1, Merge == overwrite -> "Value";
-                              I == RNum-1, Merge == seqadd    -> "Value2";
-                              I /= RNum-1                     -> f("F~w", [I])
-                           end]
-                    || I <- lists:seq(1, NF)],
+    OutFieldVars = case Merge of
+                       overwrite -> change_field_var(FNum, FieldVars, Value);
+                       seqadd    -> change_field_var(FNum, FieldVars, Value2)
+                   end,
+    FnName = mk_fn(d_field_, MsgName, FName),
+    ReadFieldDef = mk_fn(d_read_field_def_, MsgName),
+    BinMatch = ff("<<Value:~p/~s, Rest/binary>>", [BitLen, BitType]),
+    fn(FnName, [BinMatch, '_', '_' | InFieldVars], '->',
+       MergeCode ++
+           [call(ReadFieldDef, [Rest, 0, 0 | OutFieldVars])]).
 
-    [f("~p(<<Value:~p/~s, Rest/binary>>, _, _~s) ->~n",
-       [mk_fn(d_field_, MsgName, FName), BitLen, BitType, InFieldVars]),
-     f("~s", [MergeCode]),
-     f("    ~p(Rest, 0, 0~s).~n",
-       [mk_fn(d_read_field_def_, MsgName), OutFieldVars])].
-
-format_f_field_decoder_par(MsgName, BitLen, BitType, FieldDef)  ->
-    #field{name=FName}=FieldDef,
-    [f("~p(<<Value:~p/~s, Rest/binary>>, _, _, Msg) ->~n",
-       [mk_fn(d_field_, MsgName, FName), BitLen, BitType]),
-     f("    NewMsg = ~p(Value, Msg),~n", [mk_fn(add_field_, MsgName, FName)]),
-     f("    ~p(Rest, 0, 0, NewMsg).~n",
-       [mk_fn(d_read_field_def_, MsgName)])].
+format_f_field_decoder_par(MsgName, BitLen, BitType, FieldDef) ->
+    #field{rnum=RNum, name=FName}=FieldDef,
+    FNum = RNum - 1,
+    FVar = field_var(FNum),
+    Msg = "Msg",
+    Rest = "Rest",
+    Value = "Value",
+    Value2 = "Value2",
+    Merge = classify_field_merge_action(FieldDef),
+    InVar = case Merge of
+                overwrite -> Msg;
+                seqadd    -> ff("#~p{~p=~s}=Msg", [MsgName, FName, FVar])
+            end,
+    MergeCode = case Merge of
+                    overwrite -> [nop];
+                    seqadd    -> [e("Value2 = [Value | "++FVar++"]")]
+                end,
+    Out = case Merge of
+              overwrite -> ff("~s#~p{~p=~s}", [Msg, MsgName, FName, Value]);
+              seqadd    -> ff("~s#~p{~p=~s}", [Msg, MsgName, FName, Value2])
+          end,
+    FnName = mk_fn(d_field_, MsgName, FName),
+    ReadFieldDef = mk_fn(d_read_field_def_, MsgName),
+    BinMatch = ff("<<Value:~p/~s, Rest/binary>>", [BitLen, BitType]),
+    fn(FnName, [BinMatch, '_', '_', InVar], '->',
+       MergeCode ++
+           [call(ReadFieldDef, [Rest, 0, 0, Out])]).
 
 format_packed_field_seq_decoder(MsgName, #field{type=Type}=FieldDef, Opts) ->
     case Type of
@@ -1867,45 +1920,6 @@ format_dpacked_vi(MsgName, #field{name=FName, type=Type}, Opts) ->
      f("    ~p(~s, 0, 0, [FValue | AccSeq]);~n", [FnName, RestVar]),
      f("~p(<<>>, 0, 0, AccSeq) ->~n", [FnName]),
      f("    AccSeq.~n~n")].
-
-format_field_adders(MsgName, MsgDef, AnRes) ->
-    case get_field_pass(MsgName, AnRes) of
-        pass_as_params -> ""; %% handled by passing other field params
-        pass_as_record -> format_field_adders(MsgName, MsgDef)
-    end.
-
-format_field_adders(MsgName, MsgDef) ->
-    [case classify_field_merge_action(FieldDef) of
-         msgmerge  ->
-             format_field_msgmerge_adder(MsgName, FieldDef);
-         overwrite ->
-             format_field_overwrite_adder(MsgName, FieldDef);
-         seqadd ->
-             case is_packed(FieldDef) of
-                 false -> format_field_seqappend_adder(MsgName, FieldDef);
-                 true  -> ""
-             end
-     end
-     || FieldDef <- MsgDef].
-
-format_field_overwrite_adder(MsgName, #field{name=FName}) ->
-    FAdderFn = mk_fn(add_field_, MsgName, FName),
-    [f("~p(NewValue, Msg) ->~n", [FAdderFn]),
-     f("    Msg#~p{~p = NewValue}.~n~n", [MsgName, FName])].
-
-format_field_seqappend_adder(MsgName, #field{name=FName}) ->
-    FAdderFn = mk_fn(add_field_, MsgName, FName),
-    [f("~p(NewValue, #~p{~p=PrevElems}=Msg) ->~n", [FAdderFn, MsgName, FName]),
-     f("    Msg#~p{~p = [NewValue | PrevElems]}.~n~n", [MsgName, FName])].
-
-format_field_msgmerge_adder(MsgName, #field{name=FName, type={msg,FMsgName}}) ->
-    FAdderFn = mk_fn(add_field_, MsgName, FName),
-    MergeFn = mk_fn(merge_msg_, FMsgName),
-    [f("~p(NewValue, #~p{~p=undefined}=Msg) ->~n", [FAdderFn, MsgName, FName]),
-     f("    Msg#~p{~p = NewValue};~n", [MsgName, FName]),
-     f("~p(NewValue, #~p{~p=PrevValue}=Msg) ->~n", [FAdderFn, MsgName, FName]),
-     f("    Msg#~p{~p = ~p(PrevValue, NewValue)}.~n~n",
-       [MsgName, FName, MergeFn])].
 
 classify_field_merge_action(FieldDef) ->
     case FieldDef of
@@ -2611,50 +2625,18 @@ format_expr(Indent, {e, ExprFragments}) ->
     [indent(Indent1, Res)];
 format_expr(Indent, {'if',  Clauses}) ->
     [Indent1 | IndentRest] = split_indent(Indent),
-    IfClausesSep = ";" ++ '\n'() ++ indent(IndentRest+3, ""),
+    ClauseSep = ";" ++ '\n'() ++ indent(IndentRest+3, ""),
     [f(Indent1, "if "),
-     string:join(
-       [case is_one_line_expr(Res) of
-            true ->
-                f("~s -> ~s",
-                  [format_expr(0, Test), format_exprs(0, Res)]);
-            false ->
-                f("~s -> ~n~s",
-                  [format_expr(0, Test), format_exprs(IndentRest+7, Res)])
-        end
-        || {Test, '->', Res} <- Clauses],
-       IfClausesSep),
+     string:join([format_if_clause(IndentRest, Clause) || Clause <- Clauses],
+                 ClauseSep),
      '\n'(),
      f(IndentRest, "end")];
 format_expr(Indent, {'case', Expr, Cases}) ->
     [Indent1 | IndentRest] = split_indent(Indent),
-    CaseClauseSep = ";" ++ '\n'() ++ indent(IndentRest, ""),
+    ClauseSep = ";" ++ '\n'() ++ indent(IndentRest, ""),
     [f(Indent1, "case ~s of~n", [format_expr([0|Indent1+4], Expr)]),
-     string:join(
-       [case Case of
-            {Cond, '->', Res} ->
-                case is_one_line_expr(Res) of
-                    true ->
-                        f(IndentRest+4, "~s -> ~s",
-                          [stringify(Cond), format_exprs(0, Res)]);
-                    _Other ->
-                        f(IndentRest+4, "~s ->~n~s",
-                          [stringify(Cond), format_exprs(IndentRest+8, Res)])
-                end;
-            {Cond, 'when', Guard, '->', Res} ->
-                case is_one_line_expr(Res) of
-                    true ->
-                        f(IndentRest+4, "~s when ~s -> ~s",
-                          [stringify(Cond), format_expr(0, Guard),
-                           format_exprs(0, Res)]);
-                    _Other ->
-                        f(IndentRest+4, "~s when ~s ->~n~s",
-                          [stringify(Cond), format_expr(0, Guard),
-                           format_exprs(IndentRest+8, Res)])
-                end
-        end
-        || Case <- Cases],
-       CaseClauseSep),
+     string:join([format_case_case(IndentRest, Case) || Case <- Cases],
+                 ClauseSep),
      '\n'(),
      f(IndentRest, "end")];
 format_expr(Indent, {call, Fn, Args}) ->
@@ -2701,6 +2683,33 @@ update_curr_indent(I, [Char | Tl]) when is_integer(Char) ->
     update_curr_indent(I+1, Tl);
 update_curr_indent(I, [IoSubList | Tl]) when is_list(IoSubList) ->
     update_curr_indent(update_curr_indent(I, IoSubList)+1, Tl).
+
+format_if_clause(Indent, {Test, '->', Res}) ->
+    case is_one_line_expr(Res) of
+        true  -> f("~s -> ~s",
+                  [format_expr(0, Test), format_exprs(0, Res)]);
+        false -> f("~s -> ~n~s",
+                   [format_expr(0, Test), format_exprs(Indent+7, Res)])
+    end.
+
+format_case_case(Indent, {Cond, '->', Res}) ->
+    case is_one_line_expr(Res) of
+        true   -> f(Indent+4, "~s -> ~s",
+                    [stringify(Cond), format_exprs(0, Res)]);
+        _Other -> f(Indent+4, "~s ->~n~s",
+                    [stringify(Cond), format_exprs(Indent+8, Res)])
+    end;
+format_case_case(Indent, {Cond, 'when', Guard, '->', Res}) ->
+    case is_one_line_expr(Res) of
+        true ->
+            f(Indent+4, "~s when ~s -> ~s",
+              [stringify(Cond), format_expr(0, Guard),
+               format_exprs(0, Res)]);
+        _Other ->
+            f(Indent+4, "~s when ~s ->~n~s",
+              [stringify(Cond), format_expr(0, Guard),
+               format_exprs(Indent+8, Res)])
+    end.
 
 '\n'() -> f("~n"). %% possibly platform dependent??
 
