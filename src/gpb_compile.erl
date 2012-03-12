@@ -1008,10 +1008,10 @@ format_msg_encoder(MsgName, MsgDef) ->
                        RIndent, "", FieldEncoderFn, FName, I-1, KeyTxt,
                        RIndent, ""]);
                Occurrence == repeated ->
-                    f("    ~sif F~s == [] -> Bin~w;~n"
+                    f("    ~sif F~s == [] or F~s == undefined -> Bin~w;~n"
                       "    ~*s  true -> ~p(F~s, Bin~w)~n"
                       "    ~*send",
-                      [ResultVar, FName, I-1,
+                      [ResultVar, FName, Fname, I-1,
                        RIndent, "", FieldEncoderFn, FName, I-1,
                        RIndent, ""]);
                Occurrence == required ->
